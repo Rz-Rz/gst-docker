@@ -1,0 +1,249 @@
+## BASE CONTAINER - ALL GSTREAMER DEPS
+# FROM ubuntu-gstreamer:latest as base
+
+FROM ubuntu:22.04 AS opencv-builder
+
+ENV DEBIAN_FRONTEND noninteractive
+
+RUN apt-get upgrade -y
+RUN apt-get update && apt-get install -y cmake g++ unzip curl
+
+
+
+# build opencv https://docs.opencv.org/4.x/d7/d9f/tutorial_linux_install.html
+WORKDIR /install/opencv
+
+# RUN curl https://github.com/opencv/opencv/archive/refs/tags/4.7.0.zip -L --output opencv.zip
+# RUN curl https://github.com/opencv/opencv_contrib/archive/refs/tags/4.7.0.zip -L --output opencv_contrib.zip
+
+## COPY deps/opencv.zip deps/opencv_contrib.zip ./
+# RUN unzip opencv.zip
+# RUN unzip opencv_contrib.zip
+# RUN mkdir -p build
+
+# WORKDIR /install/opencv/build
+# RUN cmake -DOPENCV_GENERATE_PKGCONFIG=ON -DOPENCV_EXTRA_MODULES_PATH=../opencv_contrib-4.7.0/modules/ ../opencv-4.7.0/
+# RUN cmake --build .
+# RUN make install
+
+FROM opencv-builder AS gstreamer-builder
+
+RUN apt-get upgrade -y
+RUN apt-get update && apt-get install -y git ninja-build cmake \
+  pkg-config libmount-dev flex bison bzip2 curl
+
+RUN apt-get update && apt-get install -y python3-pip git
+RUN pip3 install meson
+
+# minimize build by providing dev libraries
+RUN apt-get update && apt-get install -y zlib1g-dev libglib2.0-dev libffi-dev libssl-dev
+
+# plugins dependencies: soundtouch
+RUN apt-get update && apt-get install -y libsndfile1-dev libsoundtouch-dev libvpx-dev
+
+# plugin dependencies: pango
+RUN apt-get update && apt-get install -y libpango1.0-dev libpangocairo-1.0-0 libcairo2-dev
+
+# plugin dependencies: vaapi
+RUN apt-get update && apt-get install -y libva-dev
+
+
+# build gstreamer
+WORKDIR /install
+
+#COPY deps/gstreamer .
+
+RUN git clone https://gitlab.freedesktop.org/gstreamer/gstreamer.git
+WORKDIR /install/gstreamer
+RUN git checkout 1.22.2
+
+# rust (change -Drs=disabled to enabled below)
+# RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# RUN ["/bin/bash", "-c", "source $HOME/.cargo/env"]
+# RUN $HOME/.cargo/bin/cargo install cargo-c
+
+RUN meson --prefix=/gstreamer/install \
+  -Dgpl=enabled \
+  -Dvaapi=enabled \
+  -Drs=disabled \
+  -Dlibav=enabled \
+  -Dgood=enabled \
+  -Dbad=enabled \
+  -Dugly=enabled \
+  -Dbase=enabled \
+  -Dlibnice=enabled \
+  -Ddevtools=disabled \
+  -Dtests=disabled \
+  -Dexamples=disabled \
+  -Ddoc=disabled \
+  -Dorc=disabled \
+  -Dlibsoup:sysprof=disabled \
+  -Dbuildtype=release build
+
+RUN ninja -C build
+RUN meson install -C build
+
+# build dlib
+WORKDIR /install/dlib
+
+# COPY deps/dlib.tar.bz2 .
+RUN curl http://dlib.net/files/dlib-19.24.tar.bz2 --output dlib.tar.bz2
+
+RUN mkdir -p /dlib/src/build /dlib/install
+RUN tar -xvf ./dlib.tar.bz2 -C . --strip-components 1
+
+WORKDIR /install/dlib/build
+RUN cmake -GNinja \
+  -DCMAKE_INSTALL_PREFIX:PATH=/dlib/install \
+  -DCMAKE_INSTALL_LIBDIR:PATH=/dlib/install/lib \
+  -DBUILD_SHARED_LIBS=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DUSE_SSE2_INSTRUCTIONS=ON \
+  -DUSE_SSE4_INSTRUCTIONS=ON \
+  -DUSE_AVX_INSTRUCTIONS=ON \
+  -DDLIB_USE_CUDA=OFF \
+  ".."
+RUN ninja
+RUN ninja install
+
+FROM opencv-builder AS final
+
+RUN apt-get upgrade -y
+RUN apt-get update
+
+# dev versions may still be useful is image is used for dev purposes
+RUN apt-get update && apt-get install -y zlib1g-dev libglib2.0-dev libffi-dev libssl-dev
+
+# plugins dependencies: soundtouch, opencv, nvcodec, vaapi
+RUN apt-get update && apt-get install -y libsndfile1 libsoundtouch1 libopencv-dev libegl1 libgles-dev
+
+# X-org dependencies
+RUN apt-get update && apt-get install -y libx11-dev libxext-dev libxfixes-dev libxi-dev libxrender-dev libxrandr-dev libxcomposite-dev libxcursor-dev libxinerama-dev libxv-dev libxkbcommon-dev libxkbcommon-x11-dev
+RUN apt-get update && apt-get install -y xserver-xorg-video-dummy
+
+COPY docker/nvidia/xorg.conf /etc/X11/xorg.conf
+
+# Wayland dependencies
+# RUN apt-get update && apt-get install -y libwayland-dev libwayland-egl-backend-dev libwayland-cursor-dev libwayland-egl1-mesa libwayland-client0 libwayland-server0
+
+# dlib additionals
+RUN apt-get update && apt-get install -y libopenblas-base \
+  libopenblas-dev \
+  liblapack-dev \
+  libdlib-data
+
+# for plugin scanner
+RUN apt-get update && apt-get install -y libpython3.10
+
+# for CGO
+RUN apt-get update && apt-get install -y libunwind-dev libdw-dev wget
+
+# for cuda* plugins (only needed as runtime dependencies, not before GStreamer build)
+WORKDIR /install/cuda
+
+# COPY deps/cuda-nvrtc-12-1_12.1.55-1_amd64.deb .
+# COPY deps/cuda-nvrtc-dev-12-1_12.1.55-1_amd64.deb .
+
+RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-nvrtc-dev-12-1_12.1.55-1_amd64.deb
+RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-nvrtc-12-1_12.1.55-1_amd64.deb
+
+RUN apt-get install ./cuda-nvrtc-12-1_12.1.55-1_amd64.deb
+RUN apt-get install ./cuda-nvrtc-dev-12-1_12.1.55-1_amd64.deb
+
+# plugin dependencies: pango
+# RUN apt-get update && apt-get install -y libpango1.0-dev libpangocairo-1.0-0 libcairo2-dev
+
+COPY --from=gstreamer-builder /gstreamer/install /opt/gstreamer
+COPY --from=gstreamer-builder /dlib/install /opt/dlib
+
+ENV PATH="${PATH}:/opt/gstreamer/bin"
+ENV LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/opt/gstreamer/lib/x86_64-linux-gnu:/opt/dlib/lib:/usr/local/cuda-11.7/lib64"
+ENV LIBRARY_PATH="${LIBRARY_PATH}:/opt/gstreamer/lib/x86_64-linux-gnu:/opt/dlib/lib:/usr/local/cuda-11.7/lib64"
+ENV PKG_CONFIG_PATH="${PKG_CONFIG_PATH}:/opt/gstreamer/lib/x86_64-linux-gnu/pkgconfig:/opt/dlib/lib/pkgconfig"
+ENV CPLUS_INCLUDE_PATH="${CPLUS_INCLUDE_PATH}:/opt/gstreamer/include/gstreamer-1.0:/opt/dlib/include"
+ENV GST_PLUGIN_PATH=/opt/gstreamer/lib/x86_64-linux-gnu/gstreamer-1.0
+ENV GST_PLUGIN_SCANNER=/opt/gstreamer/libexec/gstreamer-1.0/gst-plugin-scanner
+ENV PYTHONPATH=/opt/gstreamer/lib/python3.10/site-packages
+ENV GI_TYPELIB_PATH=/opt/gstreamer/lib/x86_64-linux-gnu/girepository-1.0/
+ENV NVIDIA_DRIVER_CAPABILITIES all
+ENV NVIDIA_VISIBLE_DEVICES all
+
+WORKDIR /
+
+# Note there is an official Rust image. Look into it. It will require using Debian (I think)
+# https://blog.logrocket.com/packaging-a-rust-web-service-using-docker/
+#
+# Inside this image xvfb is required at the moment.
+#
+
+# Currently we are not going to build gstreamer. In the future it is advisable to do this
+# as distro packages are not always up to date. Specially with Ubuntu
+
+# TODO: This needs to be split up into parts. Build the image, and then reference it
+# when building the project. This build is terribly slow. I have no idea what I am doing.
+
+ENV GST_PLUGIN_PATH=/usr/cef:$GST_PLUGIN_PATH
+ENV DISPLAY :99
+
+COPY docker/scripts/install-dependencies.sh /
+RUN ["/install-dependencies.sh"]
+
+## BUILD CONTAINER - BASE + ALL RUST / C++ DEPS
+FROM final as build
+
+ENV CLANG_VERSION=12
+ENV RUST_VERSION=1.72.0
+ENV PATH="/root/.cargo/bin:${PATH}"
+ENV CEF_DOWNLOAD_URL=https://restream-archive.s3.eu-west-1.amazonaws.com/cef
+ENV CEF_VERSION=106.1.1+g5891c70+chromium-106.0.5249.119
+
+
+ENV PATH="${PATH}:/opt/gstreamer/bin"
+ENV LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/opt/gstreamer/lib/x86_64-linux-gnu:/opt/dlib/lib:/usr/local/cuda-11.7/lib64"
+ENV LIBRARY_PATH="${LIBRARY_PATH}:/opt/gstreamer/lib/x86_64-linux-gnu:/opt/dlib/lib:/usr/local/cuda-11.7/lib64"
+ENV PKG_CONFIG_PATH="${PKG_CONFIG_PATH}:/opt/gstreamer/lib/x86_64-linux-gnu/pkgconfig:/opt/dlib/lib/pkgconfig"
+ENV CPLUS_INCLUDE_PATH="${CPLUS_INCLUDE_PATH}:/opt/gstreamer/include/gstreamer-1.0:/opt/dlib/include"
+ENV GST_PLUGIN_PATH=/opt/gstreamer/lib/x86_64-linux-gnu/gstreamer-1.0
+ENV GST_PLUGIN_SCANNER=/opt/gstreamer/libexec/gstreamer-1.0/gst-plugin-scanner
+ENV PYTHONPATH=/opt/gstreamer/lib/python3.10/site-packages
+ENV GI_TYPELIB_PATH=/opt/gstreamer/lib/x86_64-linux-gnu/girepository-1.0/
+ENV NVIDIA_DRIVER_CAPABILITIES=all
+ENV NVIDIA_VISIBLE_DEVICES=all
+
+# ENV GST_PLUGINS_RS_REPOSITORY=https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git
+# ENV GST_PLUGINS_RS_CHECKOUT=c6238a6a9f35c34e8bd4f8f4ccc727a5f8c0e6b1
+
+RUN wget -O- https://sh.rustup.rs | sh -s -- -y --default-toolchain ${RUST_VERSION}
+RUN cargo install cargo-c@0.9.17+cargo-0.69
+RUN cargo install cargo-watch
+
+# Build CEF
+ADD plugins/ ./plugins/
+COPY docker/scripts/compile-gstcef.sh /
+RUN ["/compile-gstcef.sh"]
+
+
+# Add the rest of the project files
+ADD config/ ./config/
+ADD src/ ./src/
+ADD www/ ./www/
+
+## DEV CONTAINER - USE FOR LOCAL BUILD + WATCH
+FROM build as dev
+
+RUN cargo build
+CMD [ "cargo", "watch" ]
+
+EXPOSE 3001
+
+## RELEASE CONTAINER - USE TO BUILD PRODUCTION RELEASES
+FROM build as production-build
+
+RUN cargo build --release
+
+## RUNTIME CONTAINER - USE TO RUN IN PRODUCTION ENVIRONMENT
+FROM final as production
+# Copy the built project into the runtime container
+COPY --from=production-build /usr/cef /usr/cef
+
+EXPOSE 3001

@@ -1,0 +1,20 @@
+FROM nvidia/opengl:1.0-glvnd-runtime-ubuntu20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt update && \
+        apt install -y \
+        libglvnd0 \
+        libgl1 \
+        libglx0 \
+        libegl1 \
+        libgles2 \
+        xserver-xorg-video-dummy
+
+COPY xorg.conf /etc/X11/xorg.conf
+
+ENV NVIDIA_VISIBLE_DEVICES all
+ENV NVIDIA_DRIVER_CAPABILITIES all
+ENV DISPLAY :1
+
+ENTRYPOINT ["/bin/bash"]

@@ -1,0 +1,333 @@
+From 88180f86a65767034e23727a23a1cfb3701c57c2 Mon Sep 17 00:00:00 2001
+From: Philippe Normand <philn@igalia.com>
+Date: Thu, 8 Dec 2022 18:15:39 +0000
+Subject: [PATCH 1/4] cefbin: Set source element flag
+
+---
+ gstcefbin.cc | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/gstcefbin.cc b/gstcefbin.cc
+index 513305b..0cc6743 100644
+--- a/gstcefbin.cc
++++ b/gstcefbin.cc
+@@ -113,6 +113,11 @@ gst_cef_bin_constructed (GObject *object)
+   GstElement *cefsrc, *cefdemux, *vqueue, *aqueue;
+   GstPad *srcpad;
+ 
++
++  gst_bin_set_suppressed_flags (GST_BIN_CAST (self),
++                                static_cast<GstElementFlags>(GST_ELEMENT_FLAG_SOURCE | GST_ELEMENT_FLAG_SINK));
++  GST_OBJECT_FLAG_SET (self, GST_ELEMENT_FLAG_SOURCE);
++
+   cefsrc = gst_element_factory_make("cefsrc", "cefsrc");
+   cefdemux = gst_element_factory_make("cefdemux", "cefdemux");
+   vqueue = gst_element_factory_make("queue", "video-queue");
+
+From 58fdb7c13fd3eb7623be253a913ac4218161f8a9 Mon Sep 17 00:00:00 2001
+From: Philippe Normand <philn@igalia.com>
+Date: Thu, 8 Dec 2022 18:16:13 +0000
+Subject: [PATCH 2/4] cefdemux: Register debug category
+
+---
+ gstcefdemux.cc | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/gstcefdemux.cc b/gstcefdemux.cc
+index 875819a..ddb6ee5 100644
+--- a/gstcefdemux.cc
++++ b/gstcefdemux.cc
+@@ -6,7 +6,13 @@
+ #define CEF_VIDEO_CAPS "video/x-raw, format=BGRA, width=[1, 2147483647], height=[1, 2147483647], framerate=[1/1, 60/1], pixel-aspect-ratio=1/1"
+ #define CEF_AUDIO_CAPS "audio/x-raw, format=F32LE, rate=[1, 2147483647], channels=[1, 2147483647], layout=interleaved"
+ 
+-G_DEFINE_TYPE (GstCefDemux, gst_cef_demux, GST_TYPE_ELEMENT);
++#define GST_CAT_DEFAULT gst_cef_demux_debug
++GST_DEBUG_CATEGORY_STATIC (GST_CAT_DEFAULT);
++
++#define gst_cef_demux_parent_class parent_class
++G_DEFINE_TYPE_WITH_CODE (GstCefDemux, gst_cef_demux, GST_TYPE_ELEMENT,
++                         GST_DEBUG_CATEGORY_INIT (gst_cef_demux_debug, "cefdemux", 0,
++                                                  "cefdemux element"););
+ 
+ static GstStaticPadTemplate gst_cef_demux_sink_template =
+ GST_STATIC_PAD_TEMPLATE ("sink",
+
+From da0dcc6508963a827b4a694fc73351a31f479b09 Mon Sep 17 00:00:00 2001
+From: Philippe Normand <philn@igalia.com>
+Date: Thu, 8 Dec 2022 18:16:47 +0000
+Subject: [PATCH 3/4] cefdemux: Vendor 1.18 GStreamer API
+
+This should be reverted once we bump our dependency to GStreamer >= 1.18.
+---
+ gstcefdemux.cc | 52 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/gstcefdemux.cc b/gstcefdemux.cc
+index ddb6ee5..5cba7fa 100644
+--- a/gstcefdemux.cc
++++ b/gstcefdemux.cc
+@@ -89,6 +89,58 @@ typedef struct
+   GstFlowReturn combined;
+ } AudioPushData;
+ 
++#if !GST_CHECK_VERSION(1, 18, 0)
++static GstClockTime
++gst_element_get_current_clock_time (GstElement * element)
++{
++  GstClock *clock = NULL;
++  GstClockTime ret;
++
++  g_return_val_if_fail (GST_IS_ELEMENT (element), GST_CLOCK_TIME_NONE);
++
++  clock = gst_element_get_clock (element);
++
++  if (!clock) {
++    GST_DEBUG_OBJECT (element, "Element has no clock");
++    return GST_CLOCK_TIME_NONE;
++  }
++
++  ret = gst_clock_get_time (clock);
++  gst_object_unref (clock);
++
++  return ret;
++}
++
++static GstClockTime
++gst_element_get_current_running_time (GstElement * element)
++{
++  GstClockTime base_time, clock_time;
++
++  g_return_val_if_fail (GST_IS_ELEMENT (element), GST_CLOCK_TIME_NONE);
++
++  base_time = gst_element_get_base_time (element);
++
++  if (!GST_CLOCK_TIME_IS_VALID (base_time)) {
++    GST_DEBUG_OBJECT (element, "Could not determine base time");
++    return GST_CLOCK_TIME_NONE;
++  }
++
++  clock_time = gst_element_get_current_clock_time (element);
++
++  if (!GST_CLOCK_TIME_IS_VALID (clock_time)) {
++    return GST_CLOCK_TIME_NONE;
++  }
++
++  if (clock_time < base_time) {
++    GST_DEBUG_OBJECT (element, "Got negative current running time");
++    return GST_CLOCK_TIME_NONE;
++  }
++
++  return clock_time - base_time;
++}
++#endif
++
++
+ static gboolean
+ gst_cef_demux_push_audio_buffer (GstBuffer **buffer, guint idx, AudioPushData *push_data)
+ {
+
+From fe56747052c4acaaa7f4543d54adfd4650bbc90d Mon Sep 17 00:00:00 2001
+From: Philippe Normand <philn@igalia.com>
+Date: Thu, 8 Dec 2022 18:18:12 +0000
+Subject: [PATCH 4/4] cefsrc: Apply running time on audio buffers
+
+Also add an audio meta to buffers, for good measure, and set discont flag when
+needed. This should help with A/V sync issues reported in #59.
+---
+ gstcefdemux.cc | 67 ++++++++++++++++++++++++++++++++++++++++----------
+ gstcefdemux.h  |  4 ++-
+ gstcefsrc.cc   |  9 -------
+ 3 files changed, 57 insertions(+), 23 deletions(-)
+
+diff --git a/gstcefdemux.cc b/gstcefdemux.cc
+index 5cba7fa..4073d95 100644
+--- a/gstcefdemux.cc
++++ b/gstcefdemux.cc
+@@ -64,6 +64,7 @@ gst_cef_demux_push_events (GstCefDemux *demux)
+         "channels", G_TYPE_INT, 2,
+         "layout", G_TYPE_STRING, "interleaved",
+         NULL);
++    gst_audio_info_from_caps (&demux->audio_info, audio_caps);
+     gst_pad_push_event (demux->asrcpad, gst_event_new_caps (audio_caps));
+     gst_caps_unref (audio_caps);
+ 
+@@ -144,10 +145,21 @@ gst_element_get_current_running_time (GstElement * element)
+ static gboolean
+ gst_cef_demux_push_audio_buffer (GstBuffer **buffer, guint idx, AudioPushData *push_data)
+ {
+-  GST_BUFFER_PTS (*buffer) += push_data->demux->ts_offset;
++  push_data->demux->last_audio_time = gst_element_get_current_running_time (GST_ELEMENT_CAST (push_data->demux));
++  GST_BUFFER_DTS (*buffer) = push_data->demux->last_audio_time;
++  GST_BUFFER_PTS (*buffer) = push_data->demux->last_audio_time;
++
++  gst_buffer_add_audio_meta (*buffer, &push_data->demux->audio_info, gst_buffer_get_size (*buffer), NULL);
++
++  GST_BUFFER_FLAG_UNSET (*buffer, GST_BUFFER_FLAG_DISCONT);
++  if (push_data->demux->need_discont) {
++    GST_BUFFER_FLAG_SET (*buffer, GST_BUFFER_FLAG_DISCONT);
++    push_data->demux->need_discont = FALSE;
++  }
++
+   push_data->combined = gst_flow_combiner_update_pad_flow (push_data->flow_combiner, push_data->demux->asrcpad,
+       gst_pad_push (push_data->demux->asrcpad, *buffer));
+-  push_data->demux->last_audio_time = GST_BUFFER_PTS (*buffer) + GST_BUFFER_DURATION (*buffer);
++
+   *buffer = NULL;
+   return TRUE;
+ }
+@@ -185,11 +197,6 @@ gst_cef_demux_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
+ 
+   gst_cef_demux_push_events (demux);
+ 
+-
+-  if (!GST_CLOCK_TIME_IS_VALID (demux->ts_offset)) {
+-    demux->ts_offset = GST_BUFFER_PTS (buffer);
+-  }
+-
+   for (tmp = demux->cef_audio_stream_start_events; tmp; tmp = tmp->next) {
+     const GstStructure *s = gst_event_get_structure ((GstEvent *) tmp->data);
+ 
+@@ -215,12 +222,18 @@ gst_cef_demux_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
+   ret = gst_flow_combiner_update_pad_flow (demux->flow_combiner, demux->vsrcpad,
+       gst_pad_push (demux->vsrcpad, buffer));
+ 
+-  if (demux->last_audio_time < GST_BUFFER_PTS (buffer)) {
+-    GstEvent *gap;
++  if (!GST_CLOCK_TIME_IS_VALID(demux->last_audio_time) || demux->last_audio_time < GST_BUFFER_PTS (buffer)) {
++    GstClockTime duration, timestamp;
+ 
+-    gap = gst_event_new_gap (demux->last_audio_time, GST_BUFFER_PTS (buffer) - demux->last_audio_time);
++    if (!GST_CLOCK_TIME_IS_VALID(demux->last_audio_time)) {
++      timestamp = GST_BUFFER_PTS (buffer);
++      duration = GST_BUFFER_DURATION (buffer);
++    } else {
++      timestamp = demux->last_audio_time;
++      duration = GST_BUFFER_PTS (buffer) - demux->last_audio_time;
++    }
+ 
+-    gst_pad_push_event (demux->asrcpad, gap);
++    gst_pad_push_event (demux->asrcpad, gst_event_new_gap (timestamp, duration));
+ 
+     demux->last_audio_time = GST_BUFFER_PTS (buffer);
+   }
+@@ -286,6 +299,30 @@ gst_cef_demux_sink_query (GstPad *pad, GstObject *parent, GstQuery *query)
+   return ret;
+ }
+ 
++static GstStateChangeReturn
++gst_cef_demux_change_state (GstElement * element, GstStateChange transition)
++{
++  GstStateChangeReturn result;
++  GstCefDemux *demux = (GstCefDemux *) element;
++
++  GST_DEBUG_OBJECT (element, "%s", gst_state_change_get_name (transition));
++  result = GST_CALL_PARENT_WITH_DEFAULT (GST_ELEMENT_CLASS , change_state, (element, transition), GST_STATE_CHANGE_FAILURE);
++
++  switch (transition) {
++  case GST_STATE_CHANGE_PAUSED_TO_READY:
++    gst_flow_combiner_reset (demux->flow_combiner);
++    break;
++  case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
++    demux->need_discont = TRUE;
++    break;
++  default:
++    break;
++  }
++
++  return result;
++}
++
++
+ static void
+ gst_cef_demux_init (GstCefDemux * demux)
+ {
+@@ -306,11 +343,13 @@ gst_cef_demux_init (GstCefDemux * demux)
+   gst_element_add_pad (GST_ELEMENT (demux), demux->asrcpad);
+   gst_flow_combiner_add_pad (demux->flow_combiner, demux->asrcpad);
+ 
++  gst_audio_info_init (&demux->audio_info);
++
+   demux->need_stream_start = TRUE;
+   demux->need_caps = TRUE;
+   demux->need_segment = TRUE;
+-  demux->last_audio_time = 0;
+-  demux->ts_offset = GST_CLOCK_TIME_NONE;
++  demux->need_discont = TRUE;
++  demux->last_audio_time = GST_CLOCK_TIME_NONE;
+ }
+ 
+ static void
+@@ -331,6 +370,8 @@ gst_cef_demux_class_init (GstCefDemuxClass * klass)
+ 
+   gobject_class->finalize = gst_cef_demux_finalize;
+ 
++  gstelement_class->change_state = gst_cef_demux_change_state;
++
+   gst_element_class_set_static_metadata (gstelement_class,
+       "Chromium Embedded Framework demuxer", "Demuxer/Audio/Video",
+       "Demuxes audio and video from cefsrc", "Mathieu Duponchelle <mathieu@centricular.com>");
+diff --git a/gstcefdemux.h b/gstcefdemux.h
+index 4f6ccf4..ff9b8c9 100644
+--- a/gstcefdemux.h
++++ b/gstcefdemux.h
+@@ -3,6 +3,7 @@
+ 
+ #include <gst/gst.h>
+ #include <gst/base/gstflowcombiner.h>
++#include <gst/audio/audio.h>
+ 
+ G_BEGIN_DECLS
+ 
+@@ -26,13 +27,14 @@ struct _GstCefDemux {
+   gboolean need_stream_start;
+   gboolean need_caps;
+   gboolean need_segment;
++  gboolean need_discont;
+   GstPad *vsrcpad;
+   GstPad *asrcpad;
+   GList *cef_audio_stream_start_events;
+   GstEvent *vcaps_event;
+   GstFlowCombiner *flow_combiner;
+   GstClockTime last_audio_time;
+-  GstClockTime ts_offset;
++  GstAudioInfo audio_info;
+ };
+ 
+ struct _GstCefDemuxClass {
+diff --git a/gstcefsrc.cc b/gstcefsrc.cc
+index b06897e..47e4037 100644
+--- a/gstcefsrc.cc
++++ b/gstcefsrc.cc
+@@ -182,7 +182,6 @@ class AudioHandler : public CefAudioHandler
+ 
+     mRate = params.sample_rate;
+     mChannels = channels;
+-    mCurrentTime = GST_CLOCK_TIME_NONE;
+ 
+     GST_OBJECT_LOCK (mElement);
+     mElement->audio_events = g_list_append (mElement->audio_events, event);
+@@ -214,14 +213,7 @@ class AudioHandler : public CefAudioHandler
+ 
+     GST_OBJECT_LOCK (mElement);
+ 
+-    if (!GST_CLOCK_TIME_IS_VALID (mCurrentTime)) {
+-      mCurrentTime = gst_util_uint64_scale (mElement->n_frames,
+-          mElement->vinfo.fps_d * GST_SECOND, mElement->vinfo.fps_n);
+-    }
+-
+-    GST_BUFFER_PTS (buf) = mCurrentTime;
+     GST_BUFFER_DURATION (buf) = gst_util_uint64_scale (frames, GST_SECOND, mRate);
+-    mCurrentTime += GST_BUFFER_DURATION (buf);
+ 
+     if (!mElement->audio_buffers) {
+       mElement->audio_buffers = gst_buffer_list_new();
+@@ -245,7 +237,6 @@ class AudioHandler : public CefAudioHandler
+   private:
+ 
+     GstCefSrc *mElement;
+-    GstClockTime mCurrentTime;
+     gint mRate;
+     gint mChannels;
+     IMPLEMENT_REFCOUNTING(AudioHandler);
+
