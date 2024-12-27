@@ -27,6 +27,8 @@ apt-get install -y --no-install-recommends \
   wget \
   curl \
   unzip \
+  libssl-dev \
+  libva-dev \
   zlib1g-dev \
   graphviz \
   ninja-build \
